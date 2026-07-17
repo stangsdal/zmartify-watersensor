@@ -2,141 +2,141 @@
 
 ## 1. Scope
 
-This protocol exposes the latest four-channel measurement snapshot to a local Zmartify controller. The ESP32-S2 Mini operates as an I2C slave.
+This protocol exposes the latest Zmartify Water Sensor snapshot to the local irrigation controller. The ESP32-S2 Mini operates as an I2C slave.
 
-Default address: `0x32`.
-
-The address shall be configurable and stored persistently.
+Default address: `0x32`, configurable and persisted.
 
 ## 2. Design rules
 
 - Binary, compact and versioned.
-- Little-endian integers.
-- Fixed-width integer fields.
-- No compiler struct is transmitted directly.
-- Reads return a coherent prebuilt snapshot.
-- Unknown commands shall not change device state.
-- The protocol must remain functional without Wi-Fi.
+- Little-endian fixed-width integers.
+- Explicit message and record lengths.
+- No compiler struct transmitted directly.
+- Reads return coherent prebuilt snapshots.
+- Unknown commands cannot change device state.
+- Sensor acquisition and flow counting continue without an I2C master.
+- Missing or stale values are flagged rather than encoded as valid zero values.
 
 ## 3. Transaction model
 
-The master writes a one-byte command/register identifier and then reads the expected response length.
-
-Initial commands:
+The master writes a one-byte command and then reads the response.
 
 | Command | Name | Response |
 |---:|---|---|
-| `0x00` | `GET_IDENTITY` | Device and protocol identity |
-| `0x01` | `GET_STATUS` | Device status and enabled mask |
-| `0x10` | `GET_ALL_CHANNELS` | Four-channel measurement snapshot |
-| `0x11`–`0x14` | `GET_CHANNEL_1..4` | One channel snapshot |
-| `0x20` | `GET_DIAGNOSTICS` | Runtime diagnostics |
+| `0x00` | `GET_IDENTITY` | Device, protocol and capability identity |
+| `0x01` | `GET_STATUS` | Device status and provider summary |
+| `0x10` | `GET_SENSOR_DIRECTORY` | Available typed sensor records |
+| `0x11` | `GET_ALL_SENSORS` | Current records for all sensors |
+| `0x12` | `GET_SENSOR` | One sensor selected by ID |
+| `0x20` | `GET_DIAGNOSTICS` | Runtime and provider diagnostics |
 
-Configuration writes should be added only after read-only measurement access is stable and tested.
+Configuration writes are deferred until read-only access is stable and tested.
 
 ## 4. Common frame
-
-Responses use:
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 1 | Protocol major version |
-| 1 | 1 | Message type/command echo |
-| 2 | 2 | Payload length, little-endian |
+| 1 | 1 | Message type or command echo |
+| 2 | 2 | Payload length |
 | 4 | 4 | Snapshot sequence number |
 | 8 | N | Payload |
 | 8+N | 2 | CRC-16 over header and payload |
 
-CRC polynomial and initialization must be fixed in implementation and test vectors. Recommended starting choice: CRC-16/CCITT-FALSE.
+Recommended CRC: CRC-16/CCITT-FALSE. The implementation shall include shared test vectors.
 
-## 5. Channel encoding
+## 5. Capabilities
 
-A channel payload uses integer-scaled values:
+Identity includes a capability bitmask. Initial capabilities include:
 
-| Field | Type | Scale | Description |
-|---|---|---:|---|
-| Channel index | uint8 | 1 | `0..3` |
-| Flags | uint8 | 1 | Enabled/present/activity flags |
-| Fault flags | uint16 | 1 | Channel faults |
-| Pulse count total | uint64 | 1 pulse | Monotonic count |
-| Volume total | uint64 | 1 mL | Accumulated volume |
-| Current flow | uint32 | 1 mL/min | Filtered current flow |
-| Last pulse age | uint32 | 1 ms | Saturates at `UINT32_MAX` |
-| Calibration | uint32 | 0.001 pulse/L | Pulses per liter multiplied by 1000 |
+- flow measurement;
+- accumulated volume;
+- temperature measurement;
+- typed sensor directory;
+- MQTT, HTTP and OTA support.
 
-Using scaled integers avoids floating-point representation differences between controllers.
+Future capabilities may include soil moisture, pressure, leak detection and tank level.
 
-## 6. `GET_ALL_CHANNELS`
+## 6. Sensor directory record
 
-Payload:
+Each directory entry identifies one stable logical sensor:
 
 | Field | Type | Description |
 |---|---|---|
-| Enabled mask | uint8 | Bits 0–3 correspond to channels 1–4 |
-| Active mask | uint8 | Channels with recent flow |
-| Device fault flags | uint16 | Global diagnostic flags |
-| Uptime | uint32 | Seconds |
-| Channel records | 4 × channel payload | Fixed four records |
+| Sensor ID | uint16 | Stable ID within device |
+| Sensor type | uint16 | Versioned type code |
+| Flags | uint16 | Enabled, present and readable flags |
+| Unit code | uint16 | Explicit unit identifier |
+| Hardware ID | uint64 | ROM/address when available, otherwise zero |
 
-All four records are returned even when only two channels are enabled.
+Initial sensor type codes:
 
-## 7. Identity response
-
-`GET_IDENTITY` should contain:
-
-- protocol major and minor version;
-- firmware semantic version;
-- hardware model identifier;
-- stable device identifier;
-- supported channel count;
-- capability bitmask.
-
-Strings must have explicit maximum lengths or be represented by fixed identifiers.
-
-## 8. Snapshot consistency
-
-The measurement task creates an encoded response buffer or immutable snapshot. The I2C handler copies from that state.
-
-The handler must not:
-
-- calculate flow;
-- read flash;
-- access Wi-Fi;
-- wait for another task for an unbounded time;
-- allocate dynamic memory.
-
-The sequence number increments whenever a new measurement snapshot is published internally. A master can detect repeated or missed snapshots with this field.
-
-## 9. Error behavior
-
-For an unsupported command, return an error frame with an error code such as:
-
-| Code | Meaning |
+| Code | Type |
 |---:|---|
-| `0x01` | Unsupported command |
-| `0x02` | Invalid request length |
-| `0x03` | Busy; retry later |
-| `0x04` | Configuration invalid |
-| `0x05` | Internal error |
+| `0x0001` | Flow |
+| `0x0002` | Temperature |
+| `0x0003` | Soil moisture, reserved |
+| `0x0004` | Pressure, reserved |
+| `0x0005` | Leak/contact, reserved |
 
-The device shall never reset or corrupt counters due to a malformed I2C request.
+Codes and unit identifiers must be maintained in shared protocol definitions.
 
-## 10. Versioning
+## 7. Common sensor record header
 
-- Increment the major version for incompatible frame or field changes.
-- Increment the minor version for backward-compatible additions.
-- Keep existing command meanings stable.
-- Add new commands rather than repurposing old ones.
+Every typed measurement record begins with:
 
-## 11. Validation
+| Field | Type | Description |
+|---|---|---|
+| Record length | uint16 | Allows skipping unknown record types |
+| Sensor ID | uint16 | Stable logical ID |
+| Sensor type | uint16 | Type code |
+| Flags | uint16 | Enabled, present, valid, stale and activity flags |
+| Fault flags | uint16 | Common or sensor-specific faults |
+| Reserved | uint16 | Zero in protocol v1 |
+| Sample age | uint32 | Milliseconds, saturating at `UINT32_MAX` |
 
-Provide shared protocol test vectors containing:
+Unknown record types can be skipped using `record_length`.
 
-- raw hexadecimal frame;
-- decoded field values;
-- expected CRC;
-- minimum and maximum values;
-- disabled-channel example;
-- counter values above 32 bits.
+## 8. Flow record payload
 
-The firmware and Edge/local-controller implementation should run the same test vectors in CI.
+Following the common header:
+
+| Field | Type | Unit |
+|---|---|---|
+| Pulse count total | uint64 | pulses |
+| Volume total | uint64 | milliliters |
+| Current flow | uint32 | milliliters/minute |
+| Last pulse age | uint32 | milliseconds |
+| Calibration | uint32 | 0.001 pulse/L |
+
+Four logical flow records are supported from the first revision.
+
+## 9. Temperature record payload
+
+Following the common header:
+
+| Field | Type | Unit/description |
+|---|---|---|
+| Hardware ID | uint64 | DS18B20 ROM code or other stable address |
+| Temperature | int32 | milli-degrees Celsius |
+| Applied offset | int32 | milli-degrees Celsius |
+
+The valid flag must be clear when disconnected, CRC-invalid, timed out or outside the accepted range. Consumers must inspect flags before using the numeric value.
+
+## 10. Snapshot consistency
+
+The acquisition tasks create typed records and an encoded response buffer outside the I2C callback. The callback only selects and copies bounded data.
+
+It must not calculate flow, start temperature conversions, read flash, access Wi-Fi, allocate dynamic memory or wait indefinitely.
+
+## 11. Versioning
+
+- Increment major version for incompatible frame changes.
+- Increment minor version for backward-compatible commands, record types or fields.
+- Keep existing type codes, units and meanings stable.
+- Add new record types instead of repurposing old fields.
+- Record lengths allow older consumers to skip newer types.
+
+## 12. Validation
+
+Shared tests shall include flow and temperature records, invalid/stale sensors, unknown record skipping, counter values above 32 bits, signed temperatures below zero, maximum lengths and expected CRC values.

@@ -2,141 +2,159 @@
 
 ## 1. Purpose
 
-`zmartify-flowmeter` is a reusable four-channel pulse counter and flow-measurement node based on an ESP32-S2 Mini V1.0.0.
+`zmartify-watersensor` is a reusable ESP32-S2 Mini sensor node for water and irrigation installations.
 
-The node shall:
+The node shall initially:
 
 - count pulses from up to four flow meters;
 - calculate current flow and accumulated volume;
-- preserve totals across restarts;
+- acquire temperature measurements;
+- preserve flow totals and configuration across restarts;
 - expose local measurements over I2C;
 - publish measurements over Wi-Fi to Zmartify Edge;
 - remain operational when Wi-Fi, MQTT, the Edge server or the I2C master is unavailable.
 
+The architecture shall later support soil moisture, pressure, leak, level, conductivity and related sensors without replacing the core measurement or communication layers.
+
 ## 2. System context
 
 ```text
-Flow meter 1..4
-      |
-      v
-Input protection and 5 V to 3.3 V adaptation
-      |
-      v
-ESP32-S2 Mini
-  - pulse counting
-  - flow calculation
-  - persistent totals
-  - diagnostics
-      |
-      +---- I2C ---- local controller
-      |
-      +---- Wi-Fi / MQTT ---- Zmartify Edge Server
-      |
-      +---- HTTP ---- local diagnostics and provisioning
+Flow meters 1..4 ---- pulse input adapters ----+
+                                                |
+Temperature sensors ---- 1-Wire / sensor bus ---+--> ESP32-S2 Mini
+                                                |      - sensor acquisition
+Future sensors -------- provider interfaces ----+      - validation/filtering
+                                                       - persistent counters
+                                                       - diagnostics
+                                                          |
+                                                          +-- I2C --> irrigation controller
+                                                          +-- MQTT --> Zmartify Edge
+                                                          +-- HTTP --> diagnostics/provisioning
 ```
 
-## 3. Responsibilities
+## 3. Responsibility boundaries
 
-### Flowmeter node
+### Water Sensor node
 
-- Own all raw pulse counters.
-- Apply per-channel calibration.
-- Calculate current flow and total volume.
-- Persist configuration and checkpoints.
-- Expose consistent measurement snapshots.
-- Detect channel and system faults.
-- Reconnect automatically after network failures.
+- Own raw sensor acquisition and sensor-specific drivers.
+- Own raw flow pulse counters and accumulated volume.
+- Apply calibration, filtering and validity checks.
+- Maintain a coherent, versioned sensor snapshot.
+- Persist configuration and flow checkpoints.
+- Publish telemetry and diagnostics.
+- Continue acquisition during communication outages.
+
+### Irrigation controller
+
+- Own valves, pumps and irrigation sequencing.
+- Consume measurements over I2C when local decisions require them.
+- Implement local actuator interlocks and fail-safe behavior.
+- Never depend exclusively on Wi-Fi or the Edge server for safety-critical control.
 
 ### Zmartify Edge Server
 
-- Discover and register the node.
-- Ingest telemetry.
-- Store historical measurements.
+- Discover and register the node and its capabilities.
+- Ingest and store historical measurements.
 - Provide dashboards, alerts and automation.
 - Manage desired configuration where supported.
 - Track firmware, protocol and health information.
 
-The Edge server shall not depend on receiving every individual pulse. It consumes calculated measurements and monotonic counters.
+## 4. Sensor model
 
-## 4. Authoritative state
+The firmware shall use a sensor registry rather than a single flow-channel-only model.
 
-The ESP32-S2 Mini is authoritative for:
+Every sensor has common metadata:
 
-- `pulse_count_total`;
-- `volume_total_l`;
-- channel calibration;
-- channel enabled state;
-- last-pulse timestamp;
-- current calculated flow;
-- device health.
+| Field | Description |
+|---|---|
+| `sensor_id` | Stable identifier within the device |
+| `type` | Versioned sensor type such as `flow`, `temperature` or `soil_moisture` |
+| `name` | Optional bounded friendly name |
+| `enabled` | Whether acquisition is enabled |
+| `present` | Whether the physical sensor is detected |
+| `valid` | Whether the latest value is valid |
+| `sample_age_ms` | Age of the latest valid sample |
+| `fault_flags` | Sensor-specific and common faults |
 
-I2C and MQTT are readout mechanisms for the same internal snapshot. They must not maintain separate counters.
+Sensor-specific records extend this metadata.
 
-## 5. Data model
+### Flow sensor record
 
-Each of four channels has:
+- monotonic pulse count;
+- pulses per liter;
+- accumulated volume in milliliters;
+- current flow in milliliters per minute;
+- last-pulse age.
 
-| Field | Type | Unit | Description |
-|---|---:|---|---|
-| `enabled` | boolean | — | Whether the channel participates in measurement |
-| `pulse_count_total` | uint64 | pulses | Monotonic pulse count |
-| `pulses_per_liter` | float | pulses/L | Calibration factor |
-| `volume_total_l` | double/derived | L | Accumulated volume |
-| `flow_l_min` | float | L/min | Filtered current flow |
-| `last_pulse_age_ms` | uint32 | ms | Time since last valid pulse |
-| `fault_flags` | bit field | — | Channel diagnostics |
+### Temperature sensor record
 
-The device snapshot additionally contains:
+- stable hardware identifier, such as a DS18B20 ROM code;
+- temperature in milli-degrees Celsius;
+- sample age;
+- disconnected, CRC and range fault state.
 
-- device identifier;
-- firmware version;
-- schema/protocol versions;
-- boot identifier;
-- uptime;
-- Wi-Fi and MQTT state;
-- persistence state;
-- enabled-channel bitmask.
+### Future soil-moisture record
+
+The initial architecture reserves this type but does not define a final electrical interface. A future record should expose raw reading, calibrated moisture percentage or permille, sample age and calibration profile identifier.
+
+## 5. Authoritative state
+
+The ESP32-S2 Mini is authoritative for measurements acquired by the node, including:
+
+- flow pulse counters and accumulated volume;
+- sensor identity and presence;
+- calibration and enabled state;
+- latest validated values and timestamps;
+- sensor and device health.
+
+I2C and MQTT are readout mechanisms for the same internal snapshot. They must not maintain independent counters or recalculate sensor values differently.
 
 ## 6. Availability requirements
 
-- Pulse counting must continue during Wi-Fi reconnection.
-- Pulse counting must continue while I2C transactions occur.
-- MQTT publication failure must never block measurement.
+- Pulse counting must continue during temperature conversion and bus scans.
+- Sensor acquisition must continue during Wi-Fi reconnection.
+- MQTT publication failure must never block acquisition.
 - Flash writes must never occur in an interrupt handler.
-- A software restart must restore the latest persisted totals.
-- A 32-bit millisecond timer wrap must not invalidate flow calculation.
+- I2C callbacks must return prebuilt data without slow sensor access.
+- A restart must restore the latest persisted flow totals.
+- Missing or stale values must be represented as invalid or stale, never silently converted to zero.
 
-## 7. Communication strategy
+## 7. Initial temperature design
+
+The preferred initial temperature interface is externally powered, three-wire DS18B20 on 3.3 V 1-Wire buses.
+
+Requirements:
+
+- use stable ROM IDs as sensor identity;
+- avoid parasite power for field installations;
+- schedule non-blocking conversions;
+- validate sensor CRC and plausible range;
+- make bus topology and maximum cable length explicit in the hardware design;
+- do not use a remote temperature measurement as the only physical protection for a safety-critical pump or heater.
+
+## 8. Communication strategy
 
 ### I2C
 
-Used for deterministic local access by another controller. The interface is binary, compact and versioned. See [protocol-i2c.md](protocol-i2c.md).
+Provides deterministic local access by the irrigation controller. The binary protocol exposes capabilities and typed sensor records. See [protocol-i2c.md](protocol-i2c.md).
 
 ### MQTT
 
-Primary integration with Zmartify Edge. MQTT carries retained device identity/status and periodic telemetry. See [protocol-mqtt.md](protocol-mqtt.md).
+Primary integration with Zmartify Edge. MQTT publishes retained identity/capabilities and typed telemetry. See [protocol-mqtt.md](protocol-mqtt.md).
 
 ### HTTP
 
-A lightweight local interface may provide:
+A lightweight local interface may provide health, status, provisioning, metrics and OTA endpoints. HTTP is administrative, not the primary telemetry transport.
 
-- `GET /api/v1/health`;
-- `GET /api/v1/status`;
-- local provisioning/configuration;
-- optional metrics and firmware update endpoints.
-
-HTTP is diagnostic and administrative. It is not the primary telemetry transport.
-
-## 8. Security boundaries
+## 9. Security and safety
 
 - Do not expose the device directly to the public internet.
-- Store Wi-Fi and MQTT credentials in protected persistent storage.
-- Prefer authenticated MQTT and TLS when supported by the deployment.
-- Validate all remotely supplied configuration values.
-- OTA updates must validate image integrity and support rollback where the platform permits it.
+- Protect Wi-Fi and MQTT credentials.
+- Prefer authenticated MQTT and TLS.
+- Validate all remotely supplied configuration.
+- Validate OTA image integrity and support rollback where possible.
+- Keep safety-critical actuator protection local to the actuator controller or dedicated hardware.
 
-## 9. Initial and future scope
+## 10. Evolution rules
 
-Initial deployment uses two flow meters. The complete design supports four channels without protocol or architecture changes.
-
-Potential future extensions include pressure sensors, temperature sensors, leak detectors and valve control. New capabilities must use new versioned fields or topics and must not change the meaning of existing fields.
+New sensor types shall be added through new provider implementations, typed records, capability bits and versioned protocol additions. Existing field meanings and units must not change.

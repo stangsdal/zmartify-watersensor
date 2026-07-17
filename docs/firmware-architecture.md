@@ -2,9 +2,9 @@
 
 ## 1. Objectives
 
-The firmware shall count pulses reliably while I2C, Wi-Fi, MQTT, HTTP, persistence and OTA activities occur concurrently.
+The firmware shall acquire heterogeneous sensors reliably while I2C, Wi-Fi, MQTT, HTTP, persistence and OTA activities occur concurrently.
 
-Implementation should use Arduino-ESP32 or ESP-IDF behind narrow abstractions. Measurement-domain logic must be testable without ESP32 hardware.
+Measurement-domain logic must be testable without ESP32 hardware. Hardware-specific drivers shall be hidden behind narrow interfaces.
 
 ## 2. Suggested repository structure
 
@@ -12,13 +12,18 @@ Implementation should use Arduino-ESP32 or ESP-IDF behind narrow abstractions. M
 firmware/
   include/
     app_config.h
-    flow_channel.h
+    sensor_provider.h
+    sensor_registry.h
     measurement_snapshot.h
+    flow_provider.h
+    temperature_provider.h
     protocol_i2c.h
     protocol_mqtt.h
   src/
     main.cpp
-    flow_channel.cpp
+    sensor_registry.cpp
+    flow_provider.cpp
+    temperature_provider.cpp
     measurement_service.cpp
     persistence_service.cpp
     i2c_service.cpp
@@ -28,82 +33,106 @@ firmware/
     diagnostics.cpp
   test/
     test_flow_calculation.cpp
+    test_temperature_validation.cpp
+    test_sensor_registry.cpp
     test_snapshot_serialization.cpp
     test_i2c_encoding.cpp
+    test_mqtt_schema.cpp
 ```
 
-## 3. Components
+## 3. Core abstractions
 
-### PulseCapture
+### SensorProvider
 
-- Configures four GPIO inputs.
-- Registers interrupt handlers.
-- Maintains raw monotonic counters and last-pulse timestamps.
-- Performs no networking, logging, allocation or flash access in interrupts.
+Every sensor family implements a provider interface responsible for:
 
-### MeasurementService
+- initialization and capability reporting;
+- non-blocking acquisition scheduling;
+- validation and fault reporting;
+- configuration validation;
+- publishing typed records into the common snapshot;
+- optional persistent state.
 
-- Periodically takes an atomic copy of raw counters.
-- Calculates pulse deltas and flow rates.
+A provider failure must not stop unrelated providers.
+
+### SensorRegistry
+
+The registry owns stable sensor identifiers and the latest typed records. It provides coherent immutable or lock-protected snapshots to I2C, MQTT and HTTP.
+
+### FlowProvider
+
+- Configures four GPIO pulse inputs.
+- Maintains monotonic counters and last-pulse timestamps in interrupt-safe state.
+- Calculates flow and accumulated volume.
 - Applies calibration and filtering.
-- Updates an immutable or lock-protected `MeasurementSnapshot`.
-- Detects timeout and implausible pulse-rate faults.
+- Persists counter checkpoints.
 
-### PersistenceService
+Interrupt handlers may only update bounded in-memory state. They must not perform networking, logging, allocation, sensor-bus access or flash writes.
 
-- Loads configuration and counter checkpoints from NVS.
-- Saves only when thresholds require it.
-- Uses versioned records and validates stored data.
-- Reports storage faults without stopping pulse capture.
+### TemperatureProvider
 
-### I2CService
+The initial implementation targets externally powered DS18B20 sensors.
 
-- Implements the slave protocol.
-- Returns a prebuilt binary snapshot.
-- Keeps callbacks bounded and allocation-free.
-- Never performs measurement calculations inside an I2C callback.
+Responsibilities:
 
-### NetworkService
+- discover sensors and read stable ROM IDs;
+- map configured ROM IDs to logical sensor IDs;
+- start conversions without blocking other work;
+- collect results after the required conversion interval;
+- validate CRC, range and presence;
+- publish temperature in milli-degrees Celsius;
+- retain the previous value as stale/invalid rather than replacing an error with zero.
 
-- Manages Wi-Fi connection and reconnection.
-- Exposes connectivity state to diagnostics.
-- Must never block measurement tasks waiting for a network.
+### Future providers
 
-### MQTTService
+Soil moisture, pressure, leak and level sensors shall use the same provider contract. New providers must not require changes to existing flow calculations or communication services.
 
-- Publishes retained availability and identity.
-- Publishes periodic telemetry and state changes.
-- Subscribes to versioned configuration topics if enabled.
-- Validates all incoming commands.
+## 4. Snapshot model
 
-### HTTPService
-
-- Provides health and status endpoints.
-- May provide provisioning and OTA endpoints.
-- Reads the current snapshot rather than calculating measurements.
-
-## 4. Interrupt design
-
-Each channel may use a dedicated ISR or an ISR with channel context, depending on framework support.
-
-ISR responsibilities:
+External interfaces consume one coherent snapshot.
 
 ```cpp
-counter[channel]++;
-lastPulseMicros[channel] = currentMicros;
+struct SensorCommon {
+    uint16_t sensorId;
+    uint16_t type;
+    uint16_t flags;
+    uint16_t faultFlags;
+    uint32_t sampleAgeMs;
+};
+
+struct FlowRecord {
+    SensorCommon common;
+    uint64_t pulseCountTotal;
+    uint64_t volumeTotalMilliliters;
+    uint32_t flowMillilitersPerMinute;
+    uint32_t lastPulseAgeMs;
+};
+
+struct TemperatureRecord {
+    SensorCommon common;
+    uint64_t hardwareId;
+    int32_t temperatureMilliCelsius;
+};
 ```
 
-The implementation shall consider:
+These are domain examples, not wire-format structs. I2C encoding must use explicit fields, lengths and byte order.
 
-- atomic access to 64-bit counters;
-- interrupt-safe timestamp access;
-- switch bounce or noise rejection;
-- minimum accepted interval between pulses;
-- timer wrap-safe unsigned arithmetic.
+## 5. Execution model
 
-## 5. Measurement calculation
+| Context | Typical period | Responsibility |
+|---|---:|---|
+| GPIO ISR | per pulse | Update flow counter and timestamp |
+| Flow calculation | 100–1000 ms | Calculate flow and totals |
+| Temperature state machine | configurable | Start conversions and collect results |
+| Snapshot service | 100–1000 ms/event | Publish coherent registry snapshot |
+| I2C callback/task | on request | Copy prebuilt encoded data |
+| MQTT task | 1–60 s/event | Publish state, telemetry and health |
+| Persistence task | event/5 min | Save checkpoints and configuration |
+| Diagnostics task | 1–10 s | Evaluate provider and device health |
 
-For each sampling interval:
+Use short critical sections only for counter or snapshot copies. Never hold locks during network, sensor conversion or storage I/O.
+
+## 6. Flow calculation
 
 ```text
 delta_pulses = current_count - previous_count
@@ -111,130 +140,58 @@ delta_liters = delta_pulses / pulses_per_liter
 flow_l_min = delta_liters * 60000 / delta_time_ms
 ```
 
-A low-flow mode should derive flow from the interval between recent pulses when window-based calculation becomes too coarse. The final algorithm may blend interval and window measurements.
+Filtering applies only to instantaneous flow, never accumulated totals. A low-flow algorithm may use pulse intervals when window-based calculation becomes too coarse.
 
-Filtering must not change the total volume. Filtering applies only to displayed/published instantaneous flow.
+## 7. Temperature acquisition
 
-## 6. Snapshot model
+Temperature conversion shall be implemented as a state machine:
 
-All external interfaces consume a coherent snapshot.
+1. request conversion for a bus or sensor set;
+2. return control immediately;
+3. wait using timestamps rather than blocking delays;
+4. read scratchpads after conversion time;
+5. validate CRC and range;
+6. update records and schedule the next cycle.
 
-```cpp
-struct ChannelSnapshot {
-    bool enabled;
-    uint64_t pulseCountTotal;
-    float pulsesPerLiter;
-    double volumeTotalLiters;
-    float flowLitersPerMinute;
-    uint32_t lastPulseAgeMs;
-    uint16_t faultFlags;
-};
-
-struct MeasurementSnapshot {
-    uint32_t sequence;
-    uint32_t uptimeSeconds;
-    uint8_t enabledMask;
-    ChannelSnapshot channels[4];
-};
-```
-
-The actual binary I2C representation must use fixed-width integers and explicit byte order. Do not transmit compiler structs directly.
-
-## 7. Concurrency
-
-Recommended execution model:
-
-| Context | Typical period | Responsibility |
-|---|---:|---|
-| GPIO ISR | per pulse | Increment counter and timestamp |
-| Measurement task | 100–1000 ms | Calculate and publish snapshot |
-| I2C callback/task | on request | Copy encoded snapshot |
-| MQTT task | 1–60 s/event | Publish snapshot and health |
-| Persistence task | event/5 min | Save checkpoints/configuration |
-| Diagnostics task | 1–10 s | Health and fault evaluation |
-
-Use critical sections only for short counter copies. Do not hold locks while performing network or storage I/O.
+The conversion cadence is configurable and typically much slower than flow sampling.
 
 ## 8. Persistence
 
 Persist at least:
 
 - configuration schema version;
-- device identifier and friendly name;
-- enabled-channel mask;
-- calibration per channel;
-- accumulated pulse checkpoints;
-- MQTT endpoint and credentials reference;
-- publication intervals;
+- device identity and friendly name;
+- enabled providers and sensors;
+- flow calibration and pulse checkpoints;
+- temperature ROM-to-logical-ID mapping and optional offsets;
+- MQTT and publication settings;
 - I2C address;
-- last known firmware migration version.
+- firmware migration version.
 
-Suggested checkpoint triggers:
+Use versioned records with checksums or dual generations. Minimize flash writes.
 
-- every five minutes;
-- after a configurable volume increment;
-- when flow has stopped after activity;
-- before a controlled restart or OTA update.
+## 9. Fault model
 
-Use dual records, generation numbers or checksums to survive interrupted writes.
+Common sensor faults include disabled, absent, stale, bus error, invalid configuration and out-of-range value.
 
-## 9. Configuration
+Flow-specific faults include implausible pulse rate, stuck input and invalid calibration.
 
-Configuration changes shall be validated, applied atomically and persisted only after successful validation.
+Temperature-specific faults include ROM mismatch, scratchpad CRC failure, conversion timeout, disconnected sensor and implausible temperature.
 
-Constraints include:
+Connectivity faults are health indicators and must not be treated as measurement values.
 
-- exactly four logical channels;
-- `pulses_per_liter > 0` for enabled channels;
-- bounded publish and measurement intervals;
-- valid I2C address range;
-- bounded strings;
-- no secrets in logs or telemetry.
+## 10. Configuration rules
 
-## 10. Fault flags
+- sensor IDs are stable and unique within a device;
+- type and unit semantics are immutable for a sensor ID;
+- all numeric ranges are validated;
+- configuration applies atomically;
+- unknown provider configuration is rejected safely;
+- secrets are never logged or published;
+- removing a physical sensor does not silently reassign its identity to another sensor.
 
-Suggested channel flags:
+## 11. Testing
 
-```text
-0x0001 SENSOR_DISABLED
-0x0002 NO_RECENT_PULSE
-0x0004 PULSE_RATE_TOO_HIGH
-0x0008 INPUT_STUCK_LOW
-0x0010 INPUT_STUCK_HIGH
-0x0020 CALIBRATION_INVALID
-```
+Unit tests shall cover flow calculations, timer wrap, temperature validation, provider isolation, registry consistency, serialization, persistence migration and invalid configuration.
 
-Suggested device flags:
-
-```text
-0x0001 STORAGE_ERROR
-0x0002 WIFI_DISCONNECTED
-0x0004 MQTT_DISCONNECTED
-0x0008 CONFIGURATION_INVALID
-0x0010 CLOCK_NOT_SYNCHRONIZED
-0x0020 CHECKPOINT_PENDING
-```
-
-Connectivity states are normally health indicators, not fatal measurement errors.
-
-## 11. Logging
-
-Use structured log messages with level, component and event identifier. Never log Wi-Fi passwords, MQTT passwords or access tokens.
-
-Rate-limit repeated connection errors and sensor warnings.
-
-## 12. Testing
-
-Unit tests shall cover:
-
-- flow calculation at zero, low and high rates;
-- counter wrap/delta logic;
-- timer wrap handling;
-- calibration validation;
-- snapshot consistency;
-- I2C byte encoding and CRC;
-- MQTT payload schema;
-- persistence migration and corrupted records;
-- disabled and absent channels.
-
-Hardware tests shall inject known pulse trains while Wi-Fi reconnects, MQTT is unavailable, I2C is polled and flash checkpoints occur.
+Hardware tests shall run pulse trains and temperature conversions while Wi-Fi reconnects, MQTT is unavailable, I2C is polled and checkpoints occur. A broken 1-Wire bus must not stop flow counting.

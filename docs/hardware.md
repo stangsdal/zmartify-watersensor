@@ -2,168 +2,139 @@
 
 ## 1. Controller
 
-Target controller: **ESP32-S2 Mini V1.0.0**.
+Target controller: **ESP32-S2 Mini V1.0.0** using 3.3 V GPIO logic.
 
-The board provides:
+The board shall support:
 
-- 3.3 V GPIO logic;
-- sufficient GPIOs for four pulse inputs;
-- I2C connectivity to a local controller;
-- Wi-Fi connectivity to Zmartify Edge;
-- USB support for development and recovery.
+- four pulse-based flow inputs;
+- one or more temperature-sensor buses;
+- I2C communication with the irrigation controller;
+- Wi-Fi communication with Zmartify Edge;
+- USB development and recovery;
+- reserved expansion for future sensor interfaces.
 
-The final GPIO assignment shall be recorded in firmware configuration and in the wiring diagram. Avoid boot-strapping, USB and otherwise reserved pins.
+Final GPIO assignments must avoid boot-strapping, USB and otherwise reserved pins and must be recorded in firmware configuration and a wiring table.
 
-## 2. Channel count
+## 2. Flow inputs
 
-The electrical and connector design shall support four identical channels from the first revision, even when only channels 1 and 2 are initially fitted.
+Provide four identical logical flow channels from the first revision, even when only two are populated.
 
-Suggested logical names:
-
-```text
-FLOW_CH1
-FLOW_CH2
-FLOW_CH3
-FLOW_CH4
-```
-
-Unused inputs must have a defined idle state and must not float.
-
-## 3. Flow-meter connector
-
-Recommended minimum connector per channel:
+Recommended connector:
 
 | Pin | Signal | Description |
 |---:|---|---|
 | 1 | `+5V` | Flow-meter supply |
 | 2 | `GND` | Common ground |
 | 3 | `PULSE` | Pulse output |
-| 4 | `RESERVED` | Future sensor signal or shield |
+| 4 | `RESERVED` | Shield or future signal |
 
-Connector pin order must be clearly marked. Reversing supply polarity may destroy a sensor.
+Unused inputs must have a defined idle state.
 
-## 4. Signal types
+### Open-collector/open-drain outputs
 
-Before selecting the input circuit, identify the flow meter's output type.
+Use a pull-up to 3.3 V, typically 4.7–10 kOhm. The sensor may be powered from 5 V while its transistor output is pulled up to 3.3 V.
 
-### Open-collector/open-drain output
+### Active 5 V push-pull outputs
 
-Preferred circuit:
+Never connect directly to an ESP32-S2 GPIO. Use a verified one-way 5 V to 3.3 V stage, resistor divider, transistor stage, suitable buffer or optocoupler.
 
-```text
-3.3 V
-  |
-  +-- 4.7 kOhm to 10 kOhm pull-up
-  |
-  +---------------- ESP32-S2 GPIO
-  |
-flow-meter transistor output
-  |
- GND
-```
+The existing voltage translator may be used only after confirming its part number, direction behavior, voltage limits, pulse-width performance and stability with the installed cable length.
 
-The sensor may be powered from 5 V while the signal is pulled up to 3.3 V. A voltage translator is normally unnecessary in this case.
+### Protection per flow input
 
-### Active 5 V push-pull output
+Provide footprints for:
 
-Do not connect this signal directly to an ESP32-S2 GPIO. Use a suitable one-way 5 V to 3.3 V input stage, for example:
+- approximately 1 kOhm series resistance;
+- optional RC filtering, initially not fitted;
+- optional ESD protection;
+- optional Schmitt-trigger conditioning;
+- raw and translated test points.
 
-- a 5 V-tolerant logic buffer powered for 3.3 V output;
-- a correctly dimensioned resistor divider for low-frequency clean signals;
-- a transistor input stage;
-- an optocoupler when galvanic isolation is desired.
+## 3. Temperature sensors
 
-A generic automatic bidirectional translator is not automatically suitable. Verify its behavior with push-pull signals, cable capacitance and the expected pulse width.
+The preferred initial sensor is externally powered DS18B20 using three conductors:
 
-## 5. Existing voltage translator
+| Signal | Connection |
+|---|---|
+| `VDD` | 3.3 V |
+| `GND` | common ground |
+| `DATA` | ESP32-S2 1-Wire GPIO |
 
-The existing translator may be used if all of the following are true:
+Use an external pull-up, initially 4.7 kOhm from `DATA` to 3.3 V. Avoid parasite power for field installations.
 
-1. It supports the flow meter's output type.
-2. Its high-voltage side accepts 5 V.
-3. Its low-voltage side outputs valid 3.3 V logic.
-4. It does not require an unsupported direction-control scheme.
-5. It preserves the shortest expected pulse at the maximum expected frequency.
-6. It remains stable with the installed cable length.
+### Bus topology
 
-Record the translator part number in this document before finalizing the schematic.
+1-Wire works best as a trunk with short branches. Large star topologies and long unterminated branches should be avoided. For sensors in physically separate areas, reserve the option of multiple independent 1-Wire buses.
 
-## 6. Recommended input protection
+For each bus provide:
 
-Provide footprints for each channel:
+- a connector with 3.3 V, GND and DATA;
+- a replaceable or configurable pull-up;
+- optional small series resistance near the controller;
+- ESD protection when cables leave the enclosure;
+- a data test point;
+- local decoupling near sensors where practical.
 
-```text
-PULSE connector
-    |
-  1 kOhm series resistor
-    |
-level adaptation / pull-up
-    |
-ESP32-S2 GPIO
-```
+The actual number of supported temperature sensors shall be configurable and bounded by firmware memory, timing and cable characteristics rather than hard-coded to the flow-channel count.
 
-Optional components:
+## 4. Future sensor expansion
 
-- small RC filter capacitor, initially not fitted;
-- ESD protection for long or externally routed cables;
-- Schmitt-trigger buffer for noisy or slow edges;
-- test point at the raw and translated signal.
+Reserve GPIO, power budget and connector strategy for later sensor providers such as:
 
-A capacitor can suppress noise but can also remove legitimate short pulses. Select it only after measuring the real signal.
+- soil-moisture probes;
+- pressure transducers;
+- leak contacts;
+- tank-level sensors;
+- conductivity sensors;
+- local air temperature and humidity.
 
-## 7. Grounding and power
+No universal electrical input is assumed. Future boards may need dedicated analog front ends, switched sensor power, external ADCs, protected digital inputs or additional buses.
 
-All non-isolated devices must share a common ground:
+For analog soil-moisture sensors, do not connect unknown 5 V analog outputs directly to the ESP32 ADC. Verify output range, source impedance, noise, corrosion behavior and calibration needs. Prefer corrosion-resistant capacitive probes over continuously energized resistive probes.
 
-```text
-5 V supply GND
-ESP32-S2 GND
-local controller GND
-flow-meter GND 1..4
-```
+## 5. Grounding and power
 
-Use a stable 5 V supply sized for the ESP32-S2, all installed sensors and margin. Do not assume the ESP32 board's 3.3 V regulator can supply external 5 V flow meters.
+All non-isolated devices must share a common ground. Use a stable 5 V supply sized for the ESP32-S2, installed sensors and margin.
 
 Recommended practices:
 
 - local decoupling near the ESP32-S2;
 - bulk capacitance at the 5 V input;
-- fused or current-limited sensor supply where appropriate;
-- separate routing of pulse lines from pumps, valves and mains wiring.
+- current-limited or fused external sensor supply where appropriate;
+- separate routing from pumps, valves and mains wiring;
+- optional switched power for sensors that should not be continuously energized;
+- adequate enclosure and condensation protection.
 
-## 8. I2C connection
+## 6. I2C connection
 
-When both controllers use 3.3 V I2C:
+When both controllers use 3.3 V I2C, connect SDA, SCL and GND directly and use one effective set of pull-ups. A typical starting value is 4.7 kOhm, subject to bus capacitance and length.
 
-```text
-ESP32-S2 SDA ---- local controller SDA
-ESP32-S2 SCL ---- local controller SCL
-ESP32-S2 GND ---- local controller GND
-```
+If voltage domains differ, use a bidirectional open-drain-compatible level shifter.
 
-Use only one effective set of pull-ups on each bus line. Typical starting value is 4.7 kOhm to 3.3 V, subject to bus length and capacitance.
+## 7. Safety boundary
 
-If the local controller uses a different I2C voltage, use a bidirectional open-drain-compatible level shifter.
+Temperature values sent over I2C may support irrigation decisions, frost protection and monitoring, but a remote digital sensor must not be the only protection for safety-critical overheating, pump damage or similar hazards. Use local controller interlocks or dedicated hardware protection where required.
 
-## 9. Installation considerations
+## 8. Acceptance tests
 
-For house-water monitoring:
+### Flow inputs
 
-- use connectors appropriate for the environment;
-- provide strain relief;
-- keep electronics away from condensation and leaks;
-- consider conformal coating or an enclosure with suitable ingress protection;
-- make cable shields or reserved conductors available for future noise mitigation;
-- ensure the measurement system does not compromise any certified water installation.
+- verify idle and active logic levels;
+- measure minimum pulse width and maximum frequency;
+- test intended cable lengths;
+- verify no false counts during pump and valve switching;
+- compare counts with a signal generator or oscilloscope.
 
-## 10. Hardware acceptance tests
+### Temperature buses
 
-For every channel:
+- enumerate and record stable sensor ROM IDs;
+- verify CRC and disconnect detection;
+- test minimum and maximum intended cable lengths;
+- verify measurements while flow interrupts, Wi-Fi and I2C are active;
+- test power cycling and sensor replacement;
+- verify no bus fault blocks the remaining firmware.
 
-1. Verify idle voltage at the ESP32 input.
-2. Verify high and low levels under sensor load.
-3. Measure pulse width at minimum and maximum flow.
-4. Test with the intended cable length.
-5. Verify no false counts during pump or valve switching.
-6. Verify the unconnected channel remains stable.
-7. Compare counted pulses with a signal generator or oscilloscope count.
+### Expansion
+
+- confirm reserved GPIO and power budget in each hardware revision;
+- document voltage range and protection before connecting a new sensor type.
